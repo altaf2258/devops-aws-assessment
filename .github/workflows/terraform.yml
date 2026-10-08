@@ -1,0 +1,46 @@
+name: Terraform
+
+on:
+  pull_request:
+    paths: ["terraform/**"]
+  push:
+    branches: [main]
+    paths: ["terraform/**"]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VAR_project_name: devops-assessment
+  TF_VAR_environment: dev
+  TF_VAR_aws_region: ap-south-1
+  TF_VAR_certificate_arn: ${{ vars.CERTIFICATE_ARN }}
+  TF_VAR_github_repo: ${{ github.repository }}
+
+defaults:
+  run:
+    working-directory: terraform/environments/dev
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - run: terraform fmt -check -recursive ../../
+      - run: terraform init -input=false
+      - run: terraform validate
+      - run: terraform plan -input=false -out=tfplan
+
+      - name: Apply (main only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -input=false -auto-approve tfplan

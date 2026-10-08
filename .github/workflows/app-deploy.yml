@@ -1,0 +1,75 @@
+name: App Build & Deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  PREFIX: devops-assessment-dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.APP_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push images
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          for svc in backend frontend; do
+            docker build -t $REGISTRY/$PREFIX-$svc:$TAG -t $REGISTRY/$PREFIX-$svc:latest app/$svc
+            docker push $REGISTRY/$PREFIX-$svc:$TAG
+            docker push $REGISTRY/$PREFIX-$svc:latest
+          done
+
+      - name: Upload DB schema
+        run: aws s3 cp app/database/init.sql s3://${{ vars.APP_BUCKET }}/db/init.sql
+
+      - name: Set image tag for new and existing instances
+        run: |
+          aws ssm put-parameter --name "/$PREFIX/image-tag" \
+            --type String --value "${{ github.sha }}" --overwrite
+
+      - name: Deploy to EC2 via SSM
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets "Key=tag:Name,Values=$PREFIX-app" \
+            --parameters 'commands=["/opt/deploy.sh"]' \
+            --max-concurrency 1 --max-errors 0 \
+            --query Command.CommandId --output text)
+          echo "Command: $CMD_ID"
+          for i in $(seq 1 40); do
+            STATUSES=$(aws ssm list-command-invocations --command-id $CMD_ID \
+              --query 'CommandInvocations[].Status' --output text)
+            echo "Status: $STATUSES"
+            case "$STATUSES" in
+              *Failed*|*Cancelled*|*TimedOut*) exit 1 ;;
+            esac
+            if [ -n "$STATUSES" ] && [ -z "$(echo $STATUSES | tr ' ' '\n' | grep -v '^Success$')" ]; then
+              echo "Deployed"; exit 0
+            fi
+            sleep 15
+          done
+          exit 1
+
+      - name: Health check
+        if: vars.APP_URL != ''
+        run: curl --fail --retry 10 --retry-delay 10 "${{ vars.APP_URL }}/health"
