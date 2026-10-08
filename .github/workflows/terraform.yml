@@ -6,6 +6,7 @@ on:
   push:
     branches: [main]
     paths: ["terraform/**"]
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -18,14 +19,34 @@ env:
   TF_VAR_aws_region: ap-south-1
   TF_VAR_certificate_arn: ${{ vars.CERTIFICATE_ARN }}
   TF_VAR_github_repo: ${{ github.repository }}
-
-defaults:
-  run:
-    working-directory: terraform/environments/dev
+  TRIVY_IMAGE: aquasec/trivy:latest   # pin to a fixed version in production
 
 jobs:
-  terraform:
+  # IaC security scan: reports misconfigurations in the Terraform code
+  iac-scan:
+    name: IaC security scan (Trivy config)
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Terraform for misconfigurations
+        run: |
+          docker run --rm -v ${{ github.workspace }}/terraform:/src \
+            ${{ env.TRIVY_IMAGE }} config \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            --no-progress \
+            /src
+        # exit-code 0 = report only. Some findings are intentional for this
+        # assessment (public ALB, broad CI role). Set to 1 to enforce.
+
+  terraform:
+    name: Format, validate, plan, apply
+    needs: iac-scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
     steps:
       - uses: actions/checkout@v4
 

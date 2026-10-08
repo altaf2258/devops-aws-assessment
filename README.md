@@ -61,13 +61,14 @@ terraform/
 ## 3. CI/CD flow
 
 ```
-git push -> GitHub Actions -> docker build -> push to ECR (tag = git SHA)
-         -> update SSM parameter /<prefix>/image-tag
-         -> SSM Run Command on instances -> each instance pulls from ECR and restarts containers
+git push -> checkout -> secret scan (Gitleaks) -> docker build -> image scan (Trivy)
+         -> push to ECR (tag = git SHA) -> update SSM parameter /<prefix>/image-tag
+         -> SSM Run Command: each instance pulls from ECR and restarts containers
+         -> health check -> notification (Microsoft Teams / email)
 ```
 
-- **terraform.yml**: on pull request runs `fmt -check`, `init`, `validate`, `plan`. On push to `main` it also applies.
-- **app-deploy.yml**: builds both images, pushes them to ECR tagged with the commit SHA, uploads `init.sql` to S3, updates the image-tag parameter, then deploys one instance at a time (`--max-concurrency 1`) so the others keep serving traffic. A health check runs at the end.
+- **terraform.yml**: a Trivy IaC scan reports misconfigurations, then `fmt -check`, `init`, `validate` and `plan` run on pull requests. A push to `main` also applies.
+- **app-deploy.yml**: four stages. (1) **Gitleaks** scans the full git history for secrets. (2) Both images are built and scanned by **Trivy**, and the pipeline fails on HIGH/CRITICAL findings that have a fix, so nothing vulnerable reaches ECR. (3) Images are pushed to ECR tagged with the commit SHA and deployed one instance at a time through SSM (`--max-concurrency 1`), followed by a health check. (4) A **notification** goes to Microsoft Teams and/or email with the overall result. Pull requests run only the scans and the build, with no AWS access and no push.
 - New instances launched by Auto Scaling read the same SSM parameter, so scaling always uses the current image.
 - **No AWS keys are stored in GitHub.** Workflows assume IAM roles through OIDC, restricted to this repository.
 
@@ -133,3 +134,17 @@ git push -> GitHub Actions -> docker build -> push to ECR (tag = git SHA)
 cd app
 docker compose up --build   # frontend on http://localhost:8080
 ```
+
+## 9. Deliverables checklist
+
+| # | Deliverable | Location |
+|---|---|---|
+| 1 | GitHub repository | https://github.com/altaf2258/devops-aws-assessment |
+| 2 | Terraform infrastructure code | `terraform/modules/*` and `terraform/environments/dev` (VPC, subnets, route tables, IGW, NAT, ALB, ASG, RDS, IAM, security groups, Secrets Manager, S3, ECR, OIDC) |
+| 3 | GitHub Actions CI/CD pipeline | `.github/workflows/terraform.yml`, `.github/workflows/app-deploy.yml` |
+| 4 | AWS architecture diagram | Section 1 of this README |
+| 5 | Deployment & configuration documentation | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) |
+| 6 | Application source code | `app/` (frontend, backend, database) |
+| 7 | README | This file: architecture (1), deployment steps (4), security (5), assumptions and design decisions (7) |
+
+Detailed configuration reference, CI/CD internals, operations, troubleshooting and teardown are in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).

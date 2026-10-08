@@ -174,7 +174,7 @@ Repository, Settings, Secrets and variables, Actions, **Variables**:
 | `CERTIFICATE_ARN` | ACM certificate ARN |
 | `APP_URL` (optional) | `https://<domain-or-alb-dns>` for the post-deploy health check |
 
-No AWS access keys are stored anywhere in GitHub.
+No AWS access keys are stored anywhere in GitHub. Optional notification secrets are listed in section 5.2.
 
 ### 4.5 Deploy the application
 Push a change under `app/`, or run **Actions, App Build & Deploy, Run workflow**.
@@ -195,21 +195,35 @@ Also confirm in the console: both target groups show healthy targets, and ALB ac
 
 | Event | Steps |
 |---|---|
-| Pull request touching `terraform/**` | `fmt -check`, `init`, `validate`, `plan` |
+| Pull request touching `terraform/**` | Trivy IaC scan (report only), then `fmt -check`, `init`, `validate`, `plan` |
 | Push to `main` touching `terraform/**` | the above, then `apply` of the saved plan |
 | Manual | `workflow_dispatch` |
 
 Authenticates by assuming `devops-assessment-dev-gha-terraform` through OIDC.
 
-### 5.2 `app-deploy.yml` (application)
+### 5.2 `app-deploy.yml` (application CI/CD)
 
-1. Assume `devops-assessment-dev-gha-app-deploy` through OIDC.
-2. Log in to ECR, build `backend` and `frontend` images.
-3. Push both tagged `<git-sha>` and `latest`.
-4. Upload `app/database/init.sql` to `s3://<app-bucket>/db/init.sql`.
-5. Write the git SHA to SSM parameter `/devops-assessment-dev/image-tag`.
-6. Send `/opt/deploy.sh` to instances tagged `Name=devops-assessment-dev-app` via SSM Run Command, **one instance at a time** (`--max-concurrency 1`, `--max-errors 0`), and poll for success.
-7. Optional HTTPS health check against `APP_URL`.
+| Stage | Job | What happens |
+|---|---|---|
+| 1. Checkout and secret scan | `secret-scan` | Full-history checkout, **Gitleaks** scan. Any leaked secret fails the pipeline. |
+| 2. Build | `build-scan-push` | `docker build` for `backend` and `frontend` (matrix, run in parallel). |
+| 3. Image scan | `build-scan-push` | **Trivy** scans each image. HIGH/CRITICAL vulnerabilities that have a fix fail the job, before anything is pushed. |
+| 4. Push | `build-scan-push` | Assume `devops-assessment-dev-gha-app-deploy` via OIDC, push `<git-sha>` and `latest` tags to ECR. |
+| 5. Deploy | `deploy` | Upload `init.sql` to S3, write the SHA to SSM `/devops-assessment-dev/image-tag`, run `/opt/deploy.sh` on instances tagged `Name=devops-assessment-dev-app` via SSM Run Command, **one at a time** (`--max-concurrency 1`, `--max-errors 0`), then an optional health check against `APP_URL`. |
+| 6. Notify | `notify` | Runs always. Sends the overall result to **Microsoft Teams** (incoming webhook) and/or **email** (SMTP), with a link to the run. |
+
+Pull requests run stages 1 to 3 only (no AWS credentials, no push, no deploy). Concurrent deployments are serialised with a `concurrency` group.
+
+**Notification setup** (GitHub, Settings, Secrets and variables, Actions, **Secrets**; each channel is skipped if its secrets are absent):
+
+| Secret | Purpose |
+|---|---|
+| `TEAMS_WEBHOOK_URL` | Teams channel, Workflows, "Post to a channel when a webhook request is received" |
+| `SMTP_USERNAME` | Sender address (for Gmail, the account email) |
+| `SMTP_PASSWORD` | SMTP password (for Gmail, an app password, which requires 2-step verification) |
+| `NOTIFY_EMAIL` | Recipient address |
+
+GitHub also emails the repository owner on failed workflow runs by default.
 
 ### 5.3 What `/opt/deploy.sh` does on each instance
 1. Reads the image tag from SSM.
@@ -270,7 +284,7 @@ S3 buckets and ECR repositories are configured with force-destroy for this asses
 
 ## 9. Known limitations and production hardening
 
-- Images are tagged by commit SHA; consider ECR tag immutability and image signing.
+- Images are tagged by commit SHA and scanned before push; consider ECR tag immutability, image signing, and pinning Trivy and action versions by digest.
 - Scope the Terraform CI role down from `AdministratorAccess`.
 - Replace the tolerated-failure `init.sql` step with a migration tool.
 - Add VPC endpoints (ECR, S3, Secrets Manager, SSM) to remove NAT dependency and cost.

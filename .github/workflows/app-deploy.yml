@@ -1,21 +1,104 @@
-name: App Build & Deploy
+name: App CI/CD
+
+# Pipeline: checkout -> secret scan (Gitleaks) -> docker build -> image scan (Trivy)
+#           -> push to ECR -> deploy to EC2 (SSM) -> notify (Teams / email)
 
 on:
   push:
     branches: [main]
+    paths: ["app/**", ".github/workflows/app-deploy.yml"]
+  pull_request:
     paths: ["app/**"]
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
+  pull-requests: read
+
+concurrency:
+  group: app-deploy
+  cancel-in-progress: false
 
 env:
   AWS_REGION: ap-south-1
   PREFIX: devops-assessment-dev
+  TRIVY_IMAGE: aquasec/trivy:latest   # pin to a fixed version in production
 
 jobs:
+  # ------------------------------------------------------------------
+  # 1. Checkout + secret scan
+  # ------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so old commits are scanned too
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------
+  # 2. Docker build -> Trivy image scan -> push to ECR
+  # ------------------------------------------------------------------
+  build-scan-push:
+    name: Build, scan and push (${{ matrix.service }})
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build
+        run: docker build -t ${{ matrix.service }}:${{ github.sha }} app/${{ matrix.service }}
+
+      - name: Trivy image scan (fails on HIGH/CRITICAL with a fix available)
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            ${{ env.TRIVY_IMAGE }} image \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1 \
+            --no-progress \
+            ${{ matrix.service }}:${{ github.sha }}
+
+      # Everything below runs only after the scan passes, and never on pull requests
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.APP_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.event_name != 'pull_request'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and push to ECR
+        if: github.event_name != 'pull_request'
+        env:
+          REPO: ${{ steps.ecr.outputs.registry }}/${{ env.PREFIX }}-${{ matrix.service }}
+        run: |
+          docker tag ${{ matrix.service }}:${{ github.sha }} $REPO:${{ github.sha }}
+          docker tag ${{ matrix.service }}:${{ github.sha }} $REPO:latest
+          docker push $REPO:${{ github.sha }}
+          docker push $REPO:latest
+
+  # ------------------------------------------------------------------
+  # 3. Deploy to EC2 through SSM (rolling, one instance at a time)
+  # ------------------------------------------------------------------
   deploy:
+    name: Deploy to EC2
+    needs: build-scan-push
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,29 +108,15 @@ jobs:
           role-to-assume: ${{ vars.APP_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build & push images
-        env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
-          TAG: ${{ github.sha }}
-        run: |
-          for svc in backend frontend; do
-            docker build -t $REGISTRY/$PREFIX-$svc:$TAG -t $REGISTRY/$PREFIX-$svc:latest app/$svc
-            docker push $REGISTRY/$PREFIX-$svc:$TAG
-            docker push $REGISTRY/$PREFIX-$svc:latest
-          done
-
       - name: Upload DB schema
         run: aws s3 cp app/database/init.sql s3://${{ vars.APP_BUCKET }}/db/init.sql
 
-      - name: Set image tag for new and existing instances
+      - name: Set image tag (used by new and existing instances)
         run: |
           aws ssm put-parameter --name "/$PREFIX/image-tag" \
             --type String --value "${{ github.sha }}" --overwrite
 
-      - name: Deploy to EC2 via SSM
+      - name: Pull and restart containers on instances
         run: |
           CMD_ID=$(aws ssm send-command \
             --document-name AWS-RunShellScript \
@@ -73,3 +142,76 @@ jobs:
       - name: Health check
         if: vars.APP_URL != ''
         run: curl --fail --retry 10 --retry-delay 10 "${{ vars.APP_URL }}/health"
+
+  # ------------------------------------------------------------------
+  # 4. Notify on success or failure (Teams and/or email)
+  # ------------------------------------------------------------------
+  notify:
+    name: Notify
+    needs: [secret-scan, build-scan-push, deploy]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Work out overall result
+        id: result
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "status=FAILED" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=SUCCESS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Microsoft Teams
+        if: env.TEAMS_WEBHOOK_URL != ''
+        run: |
+          TITLE="${{ steps.result.outputs.status }}: ${{ github.repository }} deploy"
+          TEXT="Commit ${GITHUB_SHA::7} by ${{ github.actor }} on ${{ github.ref_name }}. Secret scan: ${{ needs.secret-scan.result }}. Build, scan and push: ${{ needs.build-scan-push.result }}. Deploy: ${{ needs.deploy.result }}."
+          PAYLOAD=$(jq -n --arg title "$TITLE" --arg text "$TEXT" --arg url "$RUN_URL" '{
+            type: "message",
+            attachments: [{
+              contentType: "application/vnd.microsoft.card.adaptive",
+              contentUrl: null,
+              content: {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                type: "AdaptiveCard",
+                version: "1.4",
+                body: [
+                  {type: "TextBlock", size: "Medium", weight: "Bolder", text: $title},
+                  {type: "TextBlock", wrap: true, text: $text}
+                ],
+                actions: [{type: "Action.OpenUrl", title: "View run", url: $url}]
+              }
+            }]
+          }')
+          curl -sS -H "Content-Type: application/json" -d "$PAYLOAD" "$TEAMS_WEBHOOK_URL"
+
+      - name: Notify by email
+        if: env.SMTP_PASSWORD != '' && env.NOTIFY_EMAIL != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "[${{ steps.result.outputs.status }}] ${{ github.repository }} deploy"
+          to: ${{ env.NOTIFY_EMAIL }}
+          from: GitHub Actions <${{ env.SMTP_USERNAME }}>
+          body: |
+            Result: ${{ steps.result.outputs.status }}
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            Triggered by: ${{ github.actor }}
+
+            Secret scan: ${{ needs.secret-scan.result }}
+            Build, scan and push: ${{ needs.build-scan-push.result }}
+            Deploy: ${{ needs.deploy.result }}
+
+            Run: ${{ env.RUN_URL }}
